@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """Smart reader MQTT monitor.
 
-Subscribes to all MQTT topics, extracts a reader's row/column from the topic or
-JSON payload, and serves a small status page.
+Subscribes to the reader topics, keeps only RFID tag reads (heartbeat/"alive"
+responses are ignored), and serves a page where each reader position lights up
+on a tag read and then fades out. Tag reads are pushed to the browser with
+Server-Sent Events, so the page updates as soon as a message arrives.
 
 Run:
     python3 mqtt_monitor.py
-    python3 mqtt_monitor.py --mode lite --http-port 8080
+    python3 mqtt_monitor.py --http-port 8080 --fade 3
 
 The MQTT broker defaults to 192.168.1.2:1883 without authentication.
+EMQX's default ACL rejects subscriptions to a bare "#" from non-local clients,
+so the default filter is "/row/#", which matches the reader topics.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import queue
 import re
 import threading
 import time
-from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
@@ -35,121 +39,65 @@ ROW_COL_IN_TOPIC = re.compile(
     r"(?:^|/)row/(?P<row>\d+)/(?:column|col)/(?P<col>\d+)(?:/|$)",
     re.IGNORECASE,
 )
-ROW_COL_TEXT = re.compile(
-    r"\brow\s*[/=:_-]?\s*(\d+)\D+(?:column|col)\s*[/=:_-]?\s*(\d+)\b",
-    re.IGNORECASE,
-)
+
+# Reader responses look like 010308 + tag id + trailer, e.g.
+#   01030803843D3C242173050000  -> tag 03843D3C242173
+#   01030800000000000000050000  -> all-zero tag id: alive, no tag present
+# One payload can carry several responses separated by CRLF.
+TAG_RESPONSE = re.compile(r"^010308(?P<tag>[0-9A-F]{14})")
 
 
-@dataclass
-class ReaderState:
-    row: int
-    col: int
-    last_seen: float
-    topic: str
-    payload_preview: str
-    message_count: int = 1
-
-    def as_dict(self, now: float) -> dict[str, Any]:
-        age = max(0.0, now - self.last_seen)
-        return {
-            "row": self.row,
-            "col": self.col,
-            "last_seen": self.last_seen,
-            "age_seconds": round(age, 1),
-            "status": "online" if age <= 90 else "stale",
-            "topic": self.topic,
-            "payload": self.payload_preview,
-            "message_count": self.message_count,
-        }
+def is_tag_read(payload: bytes) -> bool:
+    for line in payload.decode("utf-8", errors="ignore").upper().split():
+        match = TAG_RESPONSE.match(line)
+        if match and match.group("tag").strip("0"):
+            return True
+    return False
 
 
-class ReaderStore:
-    """Thread-safe in-memory last-seen state, keyed by (row, col)."""
-
-    def __init__(self) -> None:
-        self._states: dict[tuple[int, int], ReaderState] = {}
-        self._lock = threading.Lock()
-
-    def update(self, row: int, col: int, topic: str, payload: bytes) -> None:
-        now = time.time()
-        preview = payload.decode("utf-8", errors="replace")[:240]
-        with self._lock:
-            old = self._states.get((row, col))
-            self._states[(row, col)] = ReaderState(
-                row=row,
-                col=col,
-                last_seen=now,
-                topic=topic,
-                payload_preview=preview,
-                message_count=(old.message_count + 1 if old else 1),
-            )
-
-    def snapshot(self) -> list[dict[str, Any]]:
-        now = time.time()
-        with self._lock:
-            return [state.as_dict(now) for state in self._states.values()]
-
-
-STORE = ReaderStore()
-
-
-def _as_int(value: Any) -> Optional[int]:
-    # bool is an int subclass but is never a valid coordinate here.
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _coordinates_from_object(value: Any) -> Optional[tuple[int, int]]:
-    """Find row/col in nested JSON objects used as MQTT message bodies."""
-    if isinstance(value, dict):
-        row = _as_int(value.get("row"))
-        col = _as_int(value.get("col", value.get("column")))
-        if row is not None and col is not None:
-            return row, col
-        # Some devices wrap this as sender/source/device/reader.
-        for child in value.values():
-            found = _coordinates_from_object(child)
-            if found:
-                return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _coordinates_from_object(child)
-            if found:
-                return found
-    elif isinstance(value, str):
-        found = ROW_COL_IN_TOPIC.search(value) or ROW_COL_TEXT.search(value)
-        if found:
-            return int(found.group("row") if "row" in found.groupdict() else found.group(1)), int(
-                found.group("col") if "col" in found.groupdict() else found.group(2)
-            )
-    return None
-
-
-def extract_coordinates(topic: str, payload: bytes) -> Optional[tuple[int, int]]:
-    """Extract (row, col), preferring the explicit topic path."""
+def extract_coordinates(topic: str) -> Optional[tuple[int, int]]:
     match = ROW_COL_IN_TOPIC.search(topic)
     if match:
-        return int(match.group("row")), int(match.group("col"))
-
-    text = payload.decode("utf-8", errors="replace")
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        parsed = None
-    found = _coordinates_from_object(parsed)
-    if found:
-        return found
-
-    match = ROW_COL_TEXT.search(text)
-    if match:
-        return int(match.group(1)), int(match.group(2))
+        # The gateway config has row and column swapped in the topic, so the
+        # display is transposed here instead of changing the subscriptions.
+        return int(match.group("col")), int(match.group("row"))
     return None
+
+
+class TagHub:
+    """Last tag-read time per (row, col), fanned out to SSE subscribers."""
+
+    def __init__(self) -> None:
+        self._last_seen: dict[tuple[int, int], float] = {}
+        self._subscribers: set[queue.Queue[tuple[int, int, float]]] = set()
+        self._lock = threading.Lock()
+
+    def hit(self, row: int, col: int) -> None:
+        now = time.time()
+        with self._lock:
+            self._last_seen[(row, col)] = now
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            q.put((row, col, now))
+
+    def subscribe(self) -> tuple[queue.Queue[tuple[int, int, float]], list[dict[str, Any]]]:
+        """Register a subscriber and return it with the current ages."""
+        q: queue.Queue[tuple[int, int, float]] = queue.Queue()
+        now = time.time()
+        with self._lock:
+            self._subscribers.add(q)
+            snapshot = [
+                {"row": row, "col": col, "age": now - seen}
+                for (row, col), seen in self._last_seen.items()
+            ]
+        return q, snapshot
+
+    def unsubscribe(self, q: queue.Queue[tuple[int, int, float]]) -> None:
+        with self._lock:
+            self._subscribers.discard(q)
+
+
+HUB = TagHub()
 
 
 def _mqtt_client(broker: str, port: int, subscribe_topic: str) -> Any:
@@ -173,21 +121,29 @@ def _mqtt_client(broker: str, port: int, subscribe_topic: str) -> Any:
         else:
             print(f"MQTT connect failed (code={code})")
 
+    def on_subscribe(client: mqtt.Client, userdata: Any, mid: Any, reason_codes: Any = None, *args: Any) -> None:
+        codes = reason_codes if isinstance(reason_codes, (list, tuple)) else [reason_codes]
+        values = [getattr(code, "value", code) for code in codes]
+        if any(value is None or value >= 128 for value in values):
+            print(f"MQTT subscribe to {subscribe_topic} rejected by broker (codes={values}); check the broker ACL")
+
     def on_message(client: mqtt.Client, userdata: Any, message: Any) -> None:
-        coordinates = extract_coordinates(message.topic, message.payload)
+        if not is_tag_read(message.payload):
+            return
+        coordinates = extract_coordinates(message.topic)
         if not coordinates:
             return
         row, col = coordinates
         if row < 1 or col < 1 or row > 12 or col > 12:
             return
-        STORE.update(row, col, message.topic, message.payload)
-        print(f"reader row={row} col={col} topic={message.topic}")
+        HUB.hit(row, col)
 
     def on_disconnect(client: mqtt.Client, userdata: Any, disconnect_flags: Any = None, rc: Any = None, *args: Any) -> None:
         code = getattr(rc, "value", rc)
         print(f"MQTT disconnected (code={code}); waiting to reconnect...")
 
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
     client.on_message = on_message
     client.on_disconnect = on_disconnect
     client.reconnect_delay_set(min_delay=1, max_delay=30)
@@ -210,66 +166,79 @@ h1 { margin:0 0 8px; font-size:26px; }
 .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:18px; }
 button { color:#dce6f5; background:#202a3a; border:1px solid #3a4a62; border-radius:7px; padding:8px 14px; cursor:pointer; }
 button.active { background:#2667b2; border-color:#4b9bff; }
-.legend { margin-left:auto; color:#96a2b5; font-size:13px; }
-.dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 5px 0 12px; }
-.online { background:#35d07f; } .stale { background:#f2ad42; } .empty { background:#526074; }
-#summary { color:#b8c4d7; margin-bottom:12px; }
+#conn { margin-left:auto; color:#96a2b5; font-size:13px; }
+#conn.error { color:#ff9e9e; }
 .grid { display:grid; gap:6px; }
-.cell { min-height:58px; border:1px solid #293548; border-radius:7px; padding:7px; background:#171e2a; box-sizing:border-box; }
-.cell.online { border-color:#278e61; background:#142b25; }
-.cell.stale { border-color:#8a672d; background:#2b2416; }
-.cell .pos { font-weight:600; font-size:14px; } .cell .state { font-size:12px; color:#aab7ca; margin-top:6px; }
-.cell .age { font-size:11px; color:#8491a4; margin-top:3px; }
-.error { color:#ff9e9e; }
-@media (max-width:650px) { main { padding:14px; } .cell { min-height:50px; padding:5px; } .cell .state { font-size:11px; } }
+.cell { position:relative; overflow:hidden; min-height:58px; border:1px solid #293548; border-radius:7px; background:#171e2a; }
+.cell .glow { position:absolute; inset:0; background:#35d07f; opacity:0; }
+.cell .pos { position:relative; padding:6px; font-size:12px; color:#8491a4; }
+@media (max-width:650px) { main { padding:14px; } .cell { min-height:40px; } .cell .pos { padding:3px; font-size:10px; } }
 </style>
 </head>
 <body><main>
 <h1>读卡器状态监控</h1>
-<div class="sub">收到 MQTT 消息后，按发送方的 row / col 点亮对应位置。90 秒未收到消息会标为“超时”。</div>
+<div class="sub">读到 tag 时对应位置点亮，随后渐隐。</div>
 <div class="toolbar">
   <button data-mode="lite">Lite · 6×6</button><button data-mode="pro">Pro · 12×12</button>
-  <span class="legend"><i class="dot online"></i>在线 <i class="dot stale"></i>超时 <i class="dot empty"></i>未收到</span>
+  <span id="conn">连接中…</span>
 </div>
-<div id="summary">正在读取状态…</div><div id="grid" class="grid"></div>
+<div id="grid" class="grid"></div>
 <script>
-let mode = new URLSearchParams(location.search).get('mode') === 'pro' ? 'pro' : 'lite';
+const params = new URLSearchParams(location.search);
+let mode = params.get('mode') === 'pro' ? 'pro' : 'lite';
+const fadeMs = (parseFloat(params.get('fade')) || __FADE__) * 1000;
+const lastHit = new Map();  // "row-col" -> performance.now() of the last tag read
 const buttons = [...document.querySelectorAll('button')];
-buttons.forEach(b => b.onclick = () => { mode = b.dataset.mode; history.replaceState(null, '', '?mode=' + mode); render(); });
+buttons.forEach(b => b.onclick = () => {
+  mode = b.dataset.mode; params.set('mode', mode); history.replaceState(null, '', '?' + params); render();
+});
+function glow(key) {
+  const el = document.getElementById('glow-' + key), at = lastHit.get(key);
+  if (!el || at === undefined) return;
+  el.getAnimations().forEach(a => a.cancel());
+  // A negative delay resumes the fade part-way through, e.g. after a mode switch.
+  el.animate([{opacity: 1}, {opacity: 0}], {duration: fadeMs, delay: at - performance.now(), easing: 'cubic-bezier(0.2, 0.8, 0.4, 1)', fill: 'forwards'});
+}
 function render() {
   buttons.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
   const n = mode === 'pro' ? 12 : 6;
   const grid = document.getElementById('grid'); grid.style.gridTemplateColumns = `repeat(${n}, minmax(0, 1fr))`;
-  const cells = []; for (let row=1; row<=n; row++) for (let col=1; col<=n; col++) cells.push(`<div class="cell" id="cell-${row}-${col}"><div class="pos">R${row} · C${col}</div><div class="state">未收到</div></div>`);
+  const cells = []; for (let row=1; row<=n; row++) for (let col=1; col<=n; col++) cells.push(`<div class="cell"><div class="glow" id="glow-${row}-${col}"></div><div class="pos">R${row} · C${col}</div></div>`);
   grid.innerHTML = cells.join('');
+  lastHit.forEach((_, key) => glow(key));
 }
-function update(state) {
-  const n = mode === 'pro' ? 12 : 6, map = new Map(state.map(x => [`${x.row}-${x.col}`, x]));
-  let online=0, stale=0, received=0;
-  for (let row=1; row<=n; row++) for (let col=1; col<=n; col++) {
-    const el = document.getElementById(`cell-${row}-${col}`), item = map.get(`${row}-${col}`);
-    if (!el || !item) continue;
-    received++; el.className = 'cell ' + item.status;
-    el.querySelector('.state').textContent = item.status === 'online' ? '在线' : '超时';
-    el.querySelector('.age')?.remove();
-    const age = document.createElement('div'); age.className='age'; age.textContent = `${Math.round(item.age_seconds)} 秒前 · ${item.message_count} 条`;
-    el.appendChild(age); item.status === 'online' ? online++ : stale++;
-  }
-  const total=n*n; document.getElementById('summary').textContent = `${mode === 'pro' ? 'Pro' : 'Lite'}：${online} 在线，${stale} 超时，${total-received} 个位置未收到消息 · ${new Date().toLocaleTimeString()}`;
+function hit(row, col, ageMs) {
+  if (ageMs >= fadeMs) return;
+  const key = `${row}-${col}`, at = performance.now() - ageMs;
+  if (at < (lastHit.get(key) ?? -Infinity)) return;
+  lastHit.set(key, at); glow(key);
 }
-async function poll() { try { const r=await fetch('/api/state', {cache:'no-store'}); if (!r.ok) throw Error(r.status); update(await r.json()); } catch(e) { document.getElementById('summary').innerHTML='<span class="error">无法读取监控状态</span>'; } }
-render(); poll(); setInterval(poll, 2000);
+// Events carry the server's read time. The smallest (client clock - server time)
+// seen so far is the normal transit time; anything above it is time the event
+// spent stuck in the network, so a burst after a stall shows as already faded.
+let minLag = Infinity;
+function ageOf(serverTs) { const lag = Date.now() - serverTs * 1000; minLag = Math.min(minLag, lag); return lag - minLag; }
+function connect() {
+  const conn = document.getElementById('conn'), es = new EventSource('/events');
+  es.addEventListener('snapshot', e => JSON.parse(e.data).forEach(x => x.age * 1000 < fadeMs && hit(x.row, x.col, x.age * 1000)));
+  es.addEventListener('tag', e => { const [row, col, ts] = JSON.parse(e.data); hit(row, col, ageOf(ts)); });
+  es.onopen = () => { conn.textContent = '实时'; conn.className = ''; };
+  es.onerror = () => { conn.textContent = '连接断开，重连中…'; conn.className = 'error'; };
+}
+render(); connect();
 </script></main></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
+    fade_seconds = 3.0
+
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.split("?", 1)[0] == "/api/state":
-            body = json.dumps(STORE.snapshot(), ensure_ascii=False).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-        elif self.path.split("?", 1)[0] in ("/", "/index.html"):
-            body = PAGE.encode("utf-8")
+        path = self.path.split("?", 1)[0]
+        if path == "/events":
+            self._stream_events()
+            return
+        if path in ("/", "/index.html"):
+            body = PAGE.replace("__FADE__", repr(self.fade_seconds)).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
         else:
@@ -281,6 +250,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream_events(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        q, snapshot = HUB.subscribe()
+        try:
+            self._send("snapshot", snapshot)
+            while True:
+                try:
+                    self._send("tag", q.get(timeout=15))
+                except queue.Empty:
+                    # Comment line keeps idle connections (and tunnels) open.
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except OSError:
+            pass  # browser closed the page
+        finally:
+            HUB.unsubscribe(q)
+
+    def _send(self, event: str, data: Any) -> None:
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
     def log_message(self, format: str, *args: Any) -> None:
         # Keep the terminal focused on MQTT activity.
         return
@@ -290,14 +283,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Smart reader MQTT status monitor")
     parser.add_argument("--broker", default="192.168.1.2", help="MQTT broker host (default: 192.168.1.2)")
     parser.add_argument("--port", type=int, default=1883, help="MQTT broker port (default: 1883)")
-    parser.add_argument("--subscribe", default="#", help="MQTT topic filter (default: #)")
+    parser.add_argument("--subscribe", default="/row/#", help="MQTT topic filter (default: /row/#)")
     parser.add_argument("--bind", default="0.0.0.0", help="Web bind address (default: 0.0.0.0)")
     parser.add_argument("--http-port", type=int, default=8080, help="Web port (default: 8080)")
+    parser.add_argument("--fade", type=float, default=3.0, help="Seconds for a lit cell to fade out (default: 3)")
     args = parser.parse_args()
 
+    Handler.fade_seconds = args.fade
     client = _mqtt_client(args.broker, args.port, args.subscribe)
     client.loop_start()
     server = ThreadingHTTPServer((args.bind, args.http_port), Handler)
+    server.daemon_threads = True
     print(f"Web UI: http://127.0.0.1:{args.http_port}/?mode=lite")
     print(f"Web UI: http://127.0.0.1:{args.http_port}/?mode=pro")
     try:
